@@ -21,7 +21,7 @@ TRUNCATE search_results;
 DO $$
 DECLARE
   r RECORD;
-  -- Use proper SQL string literal quoting
+  -- Proper SQL string literal quoting
   search_text TEXT := '{{ search_text | replace("'", "''") }}';
   pattern     TEXT := '%' || search_text || '%';
   sql         TEXT;
@@ -63,11 +63,15 @@ DROP TABLE IF EXISTS search_results;
 
 {% else %}
 
--- ============================================
--- FK-AWARE REPLACE: update children before parents
--- ============================================
+-- ============================================================
+-- REPLACE MODE (No superuser required)
+-- - Temporarily rebuild NON-DEFERRABLE FKs to DEFERRABLE INITIALLY DEFERRED
+-- - SET CONSTRAINTS ALL DEFERRED
+-- - Perform updates across all user tables/columns (text/varchar)
+-- - Restore FKs to original state afterwards
+-- ============================================================
 
--- 1) Summary table (outside DO)
+-- 1) Summary of updates
 CREATE TEMP TABLE IF NOT EXISTS replace_summary(
   table_schema TEXT,
   table_name   TEXT,
@@ -77,115 +81,78 @@ CREATE TEMP TABLE IF NOT EXISTS replace_summary(
 
 TRUNCATE replace_summary;
 
--- 2) Candidate columns (text/varchar) we might update
-CREATE TEMP TABLE IF NOT EXISTS update_targets(
-  table_schema TEXT,
-  table_name   TEXT,
-  column_name  TEXT
+-- 2) Capture NON-DEFERRABLE foreign keys in user schemas to toggle
+--    Handle NOT VALID by inserting DEFERRABLE before the NOT VALID suffix.
+CREATE TEMP TABLE IF NOT EXISTS fk_toggle(
+  child_schema     TEXT,
+  child_table      TEXT,
+  conname          TEXT,
+  condef_original  TEXT,
+  condef_deferrable TEXT,
+  condef_restore   TEXT
 ) ON COMMIT PRESERVE ROWS;
 
-TRUNCATE update_targets;
+TRUNCATE fk_toggle;
 
-INSERT INTO update_targets(table_schema, table_name, column_name)
-SELECT c.table_schema, c.table_name, c.column_name
-FROM information_schema.columns c
-WHERE c.data_type IN ('text','character varying','character')
-  AND c.table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
-  AND c.table_schema NOT LIKE 'pg_temp%%'
-  AND c.table_schema NOT LIKE 'pg_toast_temp%%';
-
--- 3) Distinct tables to update
-CREATE TEMP TABLE IF NOT EXISTS update_tables(
-  table_schema TEXT,
-  table_name   TEXT
-) ON COMMIT PRESERVE ROWS;
-
-TRUNCATE update_tables;
-
-INSERT INTO update_tables(table_schema, table_name)
-SELECT DISTINCT table_schema, table_name
-FROM update_targets;
-
--- 4) FK edges among our update tables: child -> parent
-CREATE TEMP TABLE IF NOT EXISTS fk_edges(
-  child_schema  TEXT,
-  child_table   TEXT,
-  parent_schema TEXT,
-  parent_table  TEXT
-) ON COMMIT PRESERVE ROWS;
-
-TRUNCATE fk_edges;
-
-INSERT INTO fk_edges(child_schema, child_table, parent_schema, parent_table)
+INSERT INTO fk_toggle(child_schema, child_table, conname, condef_original, condef_deferrable, condef_restore)
 SELECT
-  nsc.nspname  AS child_schema,
-  rc.relname   AS child_table,
-  nsp.nspname  AS parent_schema,
-  rp.relname   AS parent_table
+  nsc.nspname                    AS child_schema,
+  rc.relname                     AS child_table,
+  con.conname                    AS conname,
+  pg_get_constraintdef(con.oid)  AS condef_original,
+  CASE
+    WHEN pg_get_constraintdef(con.oid) ILIKE '% NOT VALID'
+      THEN regexp_replace(pg_get_constraintdef(con.oid), ' NOT VALID$', '') || ' DEFERRABLE INITIALLY DEFERRED NOT VALID'
+    ELSE pg_get_constraintdef(con.oid) || ' DEFERRABLE INITIALLY DEFERRED'
+  END                             AS condef_deferrable,
+  pg_get_constraintdef(con.oid)   AS condef_restore
 FROM pg_constraint con
-JOIN pg_class rc        ON rc.oid = con.conrelid
-JOIN pg_namespace nsc   ON nsc.oid = rc.relnamespace
-JOIN pg_class rp        ON rp.oid = con.confrelid
-JOIN pg_namespace nsp   ON nsp.oid = rp.relnamespace
+JOIN pg_class rc      ON rc.oid = con.conrelid
+JOIN pg_namespace nsc ON nsc.oid = rc.relnamespace
 WHERE con.contype = 'f'
+  AND NOT condeferrable
   AND nsc.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
-  AND nsp.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
-  AND (nsc.nspname NOT LIKE 'pg_temp%%' AND nsc.nspname NOT LIKE 'pg_toast_temp%%')
-  AND (nsp.nspname NOT LIKE 'pg_temp%%' AND nsp.nspname NOT LIKE 'pg_toast_temp%%')
-  AND EXISTS (
-      SELECT 1 FROM update_tables ut
-      WHERE ut.table_schema = nsc.nspname AND ut.table_name = rc.relname
-  )
-  AND EXISTS (
-      SELECT 1 FROM update_tables ut
-      WHERE ut.table_schema = nsp.nspname AND ut.table_name = rp.relname
-  );
+  AND nsc.nspname NOT LIKE 'pg_temp%%'
+  AND nsc.nspname NOT LIKE 'pg_toast_temp%%';
 
--- 5) Rank tables by number of ancestors (parents, grandparents, ...)
---    Higher rank => deeper child => update earlier
-CREATE TEMP TABLE IF NOT EXISTS table_rank(
-  table_schema TEXT,
-  table_name   TEXT,
-  rank         INT
-) ON COMMIT PRESERVE ROWS;
+-- 3) Transaction 1: make those FKs deferrable and run updates deferred
+BEGIN;
 
-TRUNCATE table_rank;
+-- 3a) Rebuild NON-DEFERRABLE FKs as DEFERRABLE INITIALLY DEFERRED
+DO $$
+DECLARE
+  fk RECORD;
+  sql TEXT;
+BEGIN
+  FOR fk IN
+    SELECT child_schema, child_table, conname, condef_deferrable
+    FROM fk_toggle
+  LOOP
+    -- Drop constraint (skip if no privilege)
+    BEGIN
+      sql := format('ALTER TABLE %I.%I DROP CONSTRAINT %I;', fk.child_schema, fk.child_table, fk.conname);
+      EXECUTE sql;
+    EXCEPTION
+      WHEN insufficient_privilege OR undefined_table OR undefined_object THEN
+        CONTINUE;
+    END;
 
-WITH RECURSIVE walk(child_schema, child_table, ancestor_schema, ancestor_table) AS (
-  SELECT child_schema, child_table, parent_schema, parent_table
-  FROM fk_edges
-  UNION
-  SELECT w.child_schema, w.child_table, e.parent_schema, e.parent_table
-  FROM walk w
-  JOIN fk_edges e
-    ON e.child_schema = w.ancestor_schema
-   AND e.child_table  = w.ancestor_table
-),
-ranked AS (
-  SELECT child_schema, child_table, COUNT(DISTINCT (ancestor_schema, ancestor_table))::INT AS r
-  FROM walk
-  GROUP BY child_schema, child_table
-)
-INSERT INTO table_rank(table_schema, table_name, rank)
-SELECT ut.table_schema, ut.table_name, COALESCE(r.r, 0)
-FROM update_tables ut
-LEFT JOIN ranked r
-  ON r.child_schema = ut.table_schema AND r.child_table = ut.table_name;
+    -- Add constraint back as DEFERRABLE
+    BEGIN
+      sql := format('ALTER TABLE %I.%I ADD CONSTRAINT %I %s;',
+                    fk.child_schema, fk.child_table, fk.conname, fk.condef_deferrable);
+      EXECUTE sql;
+    EXCEPTION
+      WHEN insufficient_privilege OR duplicate_object OR undefined_table THEN
+        CONTINUE;
+    END;
+  END LOOP;
+END $$;
 
--- 6) Ordered list: deepest children first
-CREATE TEMP TABLE IF NOT EXISTS table_order(
-  table_schema TEXT,
-  table_name   TEXT
-) ON COMMIT PRESERVE ROWS;
+-- 3b) Defer all constraints until COMMIT
+SET CONSTRAINTS ALL DEFERRED;
 
-TRUNCATE table_order;
-
-INSERT INTO table_order(table_schema, table_name)
-SELECT table_schema, table_name
-FROM table_rank
-ORDER BY rank DESC, table_schema, table_name;
-
--- 7) Perform updates in FK-aware order
+-- 3c) Perform updates across all user tables / text-like columns
 DO $$
 DECLARE
   t RECORD;
@@ -197,14 +164,19 @@ DECLARE
   updated_rows BIGINT;
 BEGIN
   FOR t IN
-    SELECT table_schema, table_name
-    FROM table_order
+    SELECT DISTINCT table_schema, table_name
+    FROM information_schema.columns
+    WHERE data_type IN ('text','character varying','character')
+      AND table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND table_schema NOT LIKE 'pg_temp%%'
+      AND table_schema NOT LIKE 'pg_toast_temp%%'
   LOOP
     FOR c IN
       SELECT column_name
-      FROM update_targets
+      FROM information_schema.columns
       WHERE table_schema = t.table_schema
         AND table_name   = t.table_name
+        AND data_type IN ('text','character varying','character')
     LOOP
       sql := format(
         'UPDATE %I.%I
@@ -228,17 +200,48 @@ BEGIN
   END LOOP;
 END $$;
 
--- 8) Report and clean up
+COMMIT;
+
+-- 4) Transaction 2: restore FKs to their original definitions
+BEGIN;
+DO $$
+DECLARE
+  fk RECORD;
+  sql TEXT;
+BEGIN
+  FOR fk IN
+    SELECT child_schema, child_table, conname, condef_restore
+    FROM fk_toggle
+  LOOP
+    -- Drop DEFERRABLE version
+    BEGIN
+      sql := format('ALTER TABLE %I.%I DROP CONSTRAINT %I;', fk.child_schema, fk.child_table, fk.conname);
+      EXECUTE sql;
+    EXCEPTION
+      WHEN insufficient_privilege OR undefined_table OR undefined_object THEN
+        CONTINUE;
+    END;
+
+    -- Recreate with original definition
+    BEGIN
+      sql := format('ALTER TABLE %I.%I ADD CONSTRAINT %I %s;',
+                    fk.child_schema, fk.child_table, fk.conname, fk.condef_restore);
+      EXECUTE sql;
+    EXCEPTION
+      WHEN insufficient_privilege OR duplicate_object OR undefined_table THEN
+        CONTINUE;
+    END;
+  END LOOP;
+END $$;
+COMMIT;
+
+-- 5) Final report and cleanup
 SELECT *
 FROM replace_summary
 WHERE rows_updated > 0
 ORDER BY rows_updated DESC, table_schema, table_name, column_name;
 
 DROP TABLE IF EXISTS replace_summary;
-DROP TABLE IF EXISTS update_targets;
-DROP TABLE IF EXISTS update_tables;
-DROP TABLE IF EXISTS fk_edges;
-DROP TABLE IF EXISTS table_rank;
-DROP TABLE IF EXISTS table_order;
+DROP TABLE IF EXISTS fk_toggle;
 
 {% endif %}
