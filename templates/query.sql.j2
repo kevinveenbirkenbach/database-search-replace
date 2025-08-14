@@ -6,23 +6,26 @@
 SET client_min_messages = NOTICE;
 
 {% if mode == 'search' %}
+
+-- Create temp table OUTSIDE the DO block and preserve rows across statements
+CREATE TEMP TABLE IF NOT EXISTS search_results (
+  table_schema   TEXT,
+  table_name     TEXT,
+  column_name    TEXT,
+  row_identifier TEXT,
+  value          TEXT
+) ON COMMIT PRESERVE ROWS;
+
+TRUNCATE search_results;
+
 DO $$
 DECLARE
   r RECORD;
+  -- Use proper SQL string literal quoting
   search_text TEXT := '{{ search_text | replace("'", "''") }}';
   pattern     TEXT := '%' || search_text || '%';
   sql         TEXT;
 BEGIN
-  CREATE TEMP TABLE IF NOT EXISTS search_results (
-    table_schema   TEXT,
-    table_name     TEXT,
-    column_name    TEXT,
-    row_identifier TEXT,
-    value          TEXT
-  ) ON COMMIT DROP;
-
-  TRUNCATE search_results;
-
   FOR r IN
     SELECT table_schema, table_name, column_name
     FROM information_schema.columns
@@ -51,11 +54,25 @@ BEGIN
   END LOOP;
 END $$;
 
--- Output results
+-- Output results and clean up
 SELECT *
 FROM search_results
 ORDER BY table_schema, table_name, column_name, row_identifier;
+
+DROP TABLE IF EXISTS search_results;
+
 {% else %}
+
+-- Create summary table OUTSIDE the DO block
+CREATE TEMP TABLE IF NOT EXISTS replace_summary(
+  table_schema TEXT,
+  table_name   TEXT,
+  column_name  TEXT,
+  rows_updated BIGINT
+) ON COMMIT PRESERVE ROWS;
+
+TRUNCATE replace_summary;
+
 DO $$
 DECLARE
   r RECORD;
@@ -65,15 +82,6 @@ DECLARE
   sql          TEXT;
   updated_rows BIGINT;
 BEGIN
-  CREATE TEMP TABLE IF NOT EXISTS replace_summary(
-    table_schema TEXT,
-    table_name   TEXT,
-    column_name  TEXT,
-    rows_updated BIGINT
-  ) ON COMMIT DROP;
-
-  TRUNCATE replace_summary;
-
   FOR r IN
     SELECT table_schema, table_name, column_name
     FROM information_schema.columns
@@ -99,13 +107,14 @@ BEGIN
         CONTINUE;
     END;
   END LOOP;
-
-  RAISE NOTICE 'Bulk replace finished.';
 END $$;
 
--- Per-column summary
+-- Report and clean up
 SELECT *
 FROM replace_summary
 WHERE rows_updated > 0
 ORDER BY rows_updated DESC, table_schema, table_name, column_name;
+
+DROP TABLE IF EXISTS replace_summary;
+
 {% endif %}
