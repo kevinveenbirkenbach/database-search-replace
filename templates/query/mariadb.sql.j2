@@ -1,0 +1,142 @@
+-- Rendered by Jinja2 for MariaDB
+-- mode: {{ mode }}
+-- search: {{ search_text }}
+-- replace: {{ replace_text if replace_text is not none else '(none)' }}
+
+-- Notes:
+-- * Uses a cursor over INFORMATION_SCHEMA.COLUMNS to generate dynamic statements.
+-- * Search mode collects matches into a TEMPORARY TABLE and prints them.
+-- * Replace mode disables foreign_key_checks for the session to avoid FK ordering issues, then restores it.
+
+{% if mode == 'search' %}
+
+CREATE TEMPORARY TABLE IF NOT EXISTS search_results (
+  table_schema  VARCHAR(255),
+  table_name    VARCHAR(255),
+  column_name   VARCHAR(255),
+  value         LONGTEXT
+);
+
+SET @search_text := '{{ search_text | replace("'", "''") }}';
+SET @pattern := CONCAT('%', @search_text, '%');
+
+DELIMITER $$
+DROP PROCEDURE IF EXISTS pgsr_search $$
+CREATE PROCEDURE pgsr_search()
+BEGIN
+  DECLARE done INT DEFAULT 0;
+  DECLARE v_schema VARCHAR(255);
+  DECLARE v_table  VARCHAR(255);
+  DECLARE v_column VARCHAR(255);
+
+  DECLARE cur CURSOR FOR
+    SELECT table_schema, table_name, column_name
+    FROM information_schema.columns
+    WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys')
+      AND data_type IN ('varchar','text','tinytext','mediumtext','longtext');
+
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+
+  OPEN cur;
+  read_loop: LOOP
+    FETCH cur INTO v_schema, v_table, v_column;
+    IF done = 1 THEN LEAVE read_loop; END IF;
+
+    SET @sql = CONCAT(
+      'INSERT INTO search_results(table_schema, table_name, column_name, value) ',
+      'SELECT ', QUOTE(v_schema), ', ', QUOTE(v_table), ', ', QUOTE(v_column), ', ',
+      'CAST(`', v_column, '` AS CHAR) FROM `', v_schema, '`.`', v_table, '` ',
+      'WHERE `', v_column, '` LIKE ?'
+    );
+    PREPARE stmt FROM @sql;
+    SET @p1 = @pattern;
+    EXECUTE stmt USING @p1;
+    DEALLOCATE PREPARE stmt;
+  END LOOP;
+  CLOSE cur;
+END $$
+DELIMITER ;
+
+CALL pgsr_search();
+DROP PROCEDURE IF EXISTS pgsr_search;
+
+SELECT * FROM search_results
+ORDER BY table_schema, table_name, column_name;
+
+DROP TEMPORARY TABLE IF EXISTS search_results;
+
+{% else %}
+
+CREATE TEMPORARY TABLE IF NOT EXISTS replace_summary (
+  table_schema  VARCHAR(255),
+  table_name    VARCHAR(255),
+  column_name   VARCHAR(255),
+  rows_updated  BIGINT
+);
+
+SET @search_text  := '{{ search_text  | replace("'", "''") }}';
+SET @replace_text := '{{ replace_text | replace("'", "''") }}';
+SET @pattern := CONCAT('%', @search_text, '%');
+
+-- Disable FK checks for the session (no superuser required in MariaDB)
+SET @old_fk := @@SESSION.foreign_key_checks;
+SET foreign_key_checks = 0;
+
+DELIMITER $$
+DROP PROCEDURE IF EXISTS pgsr_replace $$
+CREATE PROCEDURE pgsr_replace()
+BEGIN
+  DECLARE done INT DEFAULT 0;
+  DECLARE v_schema VARCHAR(255);
+  DECLARE v_table  VARCHAR(255);
+  DECLARE v_column VARCHAR(255);
+  DECLARE affected BIGINT;
+
+  DECLARE cur CURSOR FOR
+    SELECT table_schema, table_name, column_name
+    FROM information_schema.columns
+    WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys')
+      AND data_type IN ('varchar','text','tinytext','mediumtext','longtext');
+
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+
+  OPEN cur;
+  read_loop: LOOP
+    FETCH cur INTO v_schema, v_table, v_column;
+    IF done = 1 THEN LEAVE read_loop; END IF;
+
+    SET @sql = CONCAT(
+      'UPDATE `', v_schema, '`.`', v_table, '` ',
+      'SET `', v_column, '` = REPLACE(`', v_column, '`, ?, ?) ',
+      'WHERE `', v_column, '` LIKE ?'
+    );
+    PREPARE stmt FROM @sql;
+    SET @p1 = @search_text;
+    SET @p2 = @replace_text;
+    SET @p3 = @pattern;
+    EXECUTE stmt USING @p1, @p2, @p3;
+    SET affected = ROW_COUNT();
+    DEALLOCATE PREPARE stmt;
+
+    IF affected > 0 THEN
+      INSERT INTO replace_summary VALUES (v_schema, v_table, v_column, affected);
+    END IF;
+  END LOOP;
+  CLOSE cur;
+END $$
+DELIMITER ;
+
+CALL pgsr_replace();
+DROP PROCEDURE IF EXISTS pgsr_replace;
+
+-- Restore FK checks
+SET foreign_key_checks = @old_fk;
+
+SELECT *
+FROM replace_summary
+WHERE rows_updated > 0
+ORDER BY rows_updated DESC, table_schema, table_name, column_name;
+
+DROP TEMPORARY TABLE IF EXISTS replace_summary;
+
+{% endif %}
