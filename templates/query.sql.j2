@@ -63,7 +63,11 @@ DROP TABLE IF EXISTS search_results;
 
 {% else %}
 
--- Create summary table OUTSIDE the DO block
+-- ============================================
+-- FK-AWARE REPLACE: update children before parents
+-- ============================================
+
+-- 1) Summary table (outside DO)
 CREATE TEMP TABLE IF NOT EXISTS replace_summary(
   table_schema TEXT,
   table_name   TEXT,
@@ -73,48 +77,168 @@ CREATE TEMP TABLE IF NOT EXISTS replace_summary(
 
 TRUNCATE replace_summary;
 
+-- 2) Candidate columns (text/varchar) we might update
+CREATE TEMP TABLE IF NOT EXISTS update_targets(
+  table_schema TEXT,
+  table_name   TEXT,
+  column_name  TEXT
+) ON COMMIT PRESERVE ROWS;
+
+TRUNCATE update_targets;
+
+INSERT INTO update_targets(table_schema, table_name, column_name)
+SELECT c.table_schema, c.table_name, c.column_name
+FROM information_schema.columns c
+WHERE c.data_type IN ('text','character varying','character')
+  AND c.table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
+  AND c.table_schema NOT LIKE 'pg_temp%%'
+  AND c.table_schema NOT LIKE 'pg_toast_temp%%';
+
+-- 3) Distinct tables to update
+CREATE TEMP TABLE IF NOT EXISTS update_tables(
+  table_schema TEXT,
+  table_name   TEXT
+) ON COMMIT PRESERVE ROWS;
+
+TRUNCATE update_tables;
+
+INSERT INTO update_tables(table_schema, table_name)
+SELECT DISTINCT table_schema, table_name
+FROM update_targets;
+
+-- 4) FK edges among our update tables: child -> parent
+CREATE TEMP TABLE IF NOT EXISTS fk_edges(
+  child_schema  TEXT,
+  child_table   TEXT,
+  parent_schema TEXT,
+  parent_table  TEXT
+) ON COMMIT PRESERVE ROWS;
+
+TRUNCATE fk_edges;
+
+INSERT INTO fk_edges(child_schema, child_table, parent_schema, parent_table)
+SELECT
+  nsc.nspname  AS child_schema,
+  rc.relname   AS child_table,
+  nsp.nspname  AS parent_schema,
+  rp.relname   AS parent_table
+FROM pg_constraint con
+JOIN pg_class rc        ON rc.oid = con.conrelid
+JOIN pg_namespace nsc   ON nsc.oid = rc.relnamespace
+JOIN pg_class rp        ON rp.oid = con.confrelid
+JOIN pg_namespace nsp   ON nsp.oid = rp.relnamespace
+WHERE con.contype = 'f'
+  AND nsc.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+  AND nsp.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+  AND (nsc.nspname NOT LIKE 'pg_temp%%' AND nsc.nspname NOT LIKE 'pg_toast_temp%%')
+  AND (nsp.nspname NOT LIKE 'pg_temp%%' AND nsp.nspname NOT LIKE 'pg_toast_temp%%')
+  AND EXISTS (
+      SELECT 1 FROM update_tables ut
+      WHERE ut.table_schema = nsc.nspname AND ut.table_name = rc.relname
+  )
+  AND EXISTS (
+      SELECT 1 FROM update_tables ut
+      WHERE ut.table_schema = nsp.nspname AND ut.table_name = rp.relname
+  );
+
+-- 5) Rank tables by number of ancestors (parents, grandparents, ...)
+--    Higher rank => deeper child => update earlier
+CREATE TEMP TABLE IF NOT EXISTS table_rank(
+  table_schema TEXT,
+  table_name   TEXT,
+  rank         INT
+) ON COMMIT PRESERVE ROWS;
+
+TRUNCATE table_rank;
+
+WITH RECURSIVE walk(child_schema, child_table, ancestor_schema, ancestor_table) AS (
+  SELECT child_schema, child_table, parent_schema, parent_table
+  FROM fk_edges
+  UNION
+  SELECT w.child_schema, w.child_table, e.parent_schema, e.parent_table
+  FROM walk w
+  JOIN fk_edges e
+    ON e.child_schema = w.ancestor_schema
+   AND e.child_table  = w.ancestor_table
+),
+ranked AS (
+  SELECT child_schema, child_table, COUNT(DISTINCT (ancestor_schema, ancestor_table))::INT AS r
+  FROM walk
+  GROUP BY child_schema, child_table
+)
+INSERT INTO table_rank(table_schema, table_name, rank)
+SELECT ut.table_schema, ut.table_name, COALESCE(r.r, 0)
+FROM update_tables ut
+LEFT JOIN ranked r
+  ON r.child_schema = ut.table_schema AND r.child_table = ut.table_name;
+
+-- 6) Ordered list: deepest children first
+CREATE TEMP TABLE IF NOT EXISTS table_order(
+  table_schema TEXT,
+  table_name   TEXT
+) ON COMMIT PRESERVE ROWS;
+
+TRUNCATE table_order;
+
+INSERT INTO table_order(table_schema, table_name)
+SELECT table_schema, table_name
+FROM table_rank
+ORDER BY rank DESC, table_schema, table_name;
+
+-- 7) Perform updates in FK-aware order
 DO $$
 DECLARE
-  r RECORD;
+  t RECORD;
+  c RECORD;
   search_text  TEXT := '{{ search_text | replace("'", "''") }}';
   replace_text TEXT := '{{ replace_text | replace("'", "''") }}';
   pattern      TEXT := '%' || search_text || '%';
   sql          TEXT;
   updated_rows BIGINT;
 BEGIN
-  FOR r IN
-    SELECT table_schema, table_name, column_name
-    FROM information_schema.columns
-    WHERE data_type IN ('text','character varying','character')
-      AND table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
-      AND table_schema NOT LIKE 'pg_temp%%'
-      AND table_schema NOT LIKE 'pg_toast_temp%%'
+  FOR t IN
+    SELECT table_schema, table_name
+    FROM table_order
   LOOP
-    sql := format(
-      'UPDATE %I.%I
-       SET %I = REPLACE(%I, %L, %L)
-       WHERE %I ILIKE %L',
-       r.table_schema, r.table_name, r.column_name,
-       r.column_name, search_text, replace_text,
-       r.column_name, pattern
-    );
-    BEGIN
-      EXECUTE sql;
-      GET DIAGNOSTICS updated_rows = ROW_COUNT;
-      INSERT INTO replace_summary VALUES (r.table_schema, r.table_name, r.column_name, updated_rows);
-    EXCEPTION
-      WHEN insufficient_privilege OR undefined_table THEN
-        CONTINUE;
-    END;
+    FOR c IN
+      SELECT column_name
+      FROM update_targets
+      WHERE table_schema = t.table_schema
+        AND table_name   = t.table_name
+    LOOP
+      sql := format(
+        'UPDATE %I.%I
+         SET %I = REPLACE(%I, %L, %L)
+         WHERE %I ILIKE %L',
+         t.table_schema, t.table_name, c.column_name,
+         c.column_name, search_text, replace_text,
+         c.column_name, pattern
+      );
+      BEGIN
+        EXECUTE sql;
+        GET DIAGNOSTICS updated_rows = ROW_COUNT;
+        IF updated_rows > 0 THEN
+          INSERT INTO replace_summary VALUES (t.table_schema, t.table_name, c.column_name, updated_rows);
+        END IF;
+      EXCEPTION
+        WHEN insufficient_privilege OR undefined_table THEN
+          CONTINUE;
+      END;
+    END LOOP;
   END LOOP;
 END $$;
 
--- Report and clean up
+-- 8) Report and clean up
 SELECT *
 FROM replace_summary
 WHERE rows_updated > 0
 ORDER BY rows_updated DESC, table_schema, table_name, column_name;
 
 DROP TABLE IF EXISTS replace_summary;
+DROP TABLE IF EXISTS update_targets;
+DROP TABLE IF EXISTS update_tables;
+DROP TABLE IF EXISTS fk_edges;
+DROP TABLE IF EXISTS table_rank;
+DROP TABLE IF EXISTS table_order;
 
 {% endif %}
