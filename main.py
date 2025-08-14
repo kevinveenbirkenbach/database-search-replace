@@ -28,6 +28,16 @@ def build_args():
     return p.parse_args()
 
 
+def script_root() -> Path:
+    """
+    Determine the directory of this script, resolving symlinks.
+    If bundled (PyInstaller), use the executable path.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 def render_sql(mode: str, search_text: str, replace_text: str | None, template_dir: Path) -> str:
     env = Environment(
         loader=FileSystemLoader(str(template_dir)),
@@ -56,10 +66,7 @@ def run_psql(sql_text: str, args):
         "-f", str(tmp_sql_path),
     ]
 
-    if args.container:
-        cmd = ["docker", "exec", "-i", args.container] + psql_cmd
-    else:
-        cmd = psql_cmd
+    cmd = ["docker", "exec", "-i", args.container] + psql_cmd if args.container else psql_cmd
 
     try:
         print("Executing:", " ".join(cmd))
@@ -78,9 +85,15 @@ def main():
     args = build_args()
     mode = "replace" if args.replace is not None else "search"
 
-    template_dir = Path(__file__).parent / "templates"
-    if not (template_dir / "query.sql.j2").exists():
-        print(f"ERROR: Template not found at {template_dir / 'query.sql.j2'}", file=sys.stderr)
+    template_dir = script_root() / "templates"
+    template_path = template_dir / "query.sql.j2"
+    if not template_path.exists():
+        print(
+            "ERROR: Template not found.\n"
+            f"Expected at: {template_path}\n"
+            "Make sure the 'templates/query.sql.j2' file is installed next to this script.",
+            file=sys.stderr
+        )
         sys.exit(2)
 
     sql_text = render_sql(mode=mode, search_text=args.search, replace_text=args.replace, template_dir=template_dir)
