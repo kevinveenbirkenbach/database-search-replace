@@ -29,10 +29,7 @@ def build_args():
 
 
 def script_root() -> Path:
-    """
-    Determine the directory of this script, resolving symlinks.
-    If bundled (PyInstaller), use the executable path.
-    """
+    """Directory of this script, resolving symlinks (works when /usr/local/bin/pgsr is a symlink)."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
@@ -49,36 +46,42 @@ def render_sql(mode: str, search_text: str, replace_text: str | None, template_d
 
 
 def run_psql(sql_text: str, args):
-    # Write SQL to a temp file for clarity
-    tmp_sql_path = Path.cwd() / ".pg_bulk_find_replace.sql"
-    tmp_sql_path.write_text(sql_text, encoding="utf-8")
-
     env = os.environ.copy()
-    env["PGPASSWORD"] = args.password
 
-    psql_cmd = [
+    # Build base psql command; we will either use -f <tempfile> (host)
+    # or -f - with stdin (container).
+    base_psql = [
         args.psql_path,
         "-v", "ON_ERROR_STOP=1",
         "-h", args.host,
         "-p", str(args.port),
         "-U", args.user,
         "-d", args.database,
-        "-f", str(tmp_sql_path),
     ]
 
-    cmd = ["docker", "exec", "-i", args.container] + psql_cmd if args.container else psql_cmd
-
-    try:
+    if args.container:
+        # In container: feed SQL via stdin and set PGPASSWORD inside container.
+        cmd = [
+            "docker", "exec", "-i", args.container,
+            "env", f"PGPASSWORD={args.password}",
+            *base_psql, "-f", "-"   # read SQL from stdin
+        ]
         print("Executing:", " ".join(cmd))
-        subprocess.run(cmd, check=True, env=env)
-    except subprocess.CalledProcessError as e:
-        print(f"ERROR: psql exited with code {e.returncode}", file=sys.stderr)
-        sys.exit(e.returncode)
-    finally:
+        subprocess.run(cmd, check=True, input=sql_text.encode("utf-8"))
+    else:
+        # Local: write a temp file and point psql at it.
+        tmp_sql_path = Path.cwd() / ".pg_bulk_find_replace.sql"
+        tmp_sql_path.write_text(sql_text, encoding="utf-8")
+        env["PGPASSWORD"] = args.password
+        cmd = [*base_psql, "-f", str(tmp_sql_path)]
         try:
-            tmp_sql_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+            print("Executing:", " ".join(cmd))
+            subprocess.run(cmd, check=True, env=env)
+        finally:
+            try:
+                tmp_sql_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def main():
@@ -91,7 +94,7 @@ def main():
         print(
             "ERROR: Template not found.\n"
             f"Expected at: {template_path}\n"
-            "Make sure the 'templates/query.sql.j2' file is installed next to this script.",
+            "Make sure 'templates/query.sql.j2' is installed next to this script.",
             file=sys.stderr
         )
         sys.exit(2)
