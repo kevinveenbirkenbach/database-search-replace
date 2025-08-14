@@ -1,11 +1,33 @@
-# pg_bulk_find_replace
+# pgsr — PostgreSQL Search & Replace 🔎✏️
 
-Bulk **search** (and optional **replace**) of strings across all text/varchar columns in a PostgreSQL database.
+Bulk **search** (and optional **replace**) of strings across all `text` / `varchar` columns in a PostgreSQL database.
+
 - Runs either **natively** on the host (using `psql`) or **inside a container** via `docker exec` when `--container` is provided.
-- The SQL logic is rendered from a single **Jinja2** template (`templates/query.sql.j2`) so you can easily modify the behavior.
-- Safe-by-default: uses server-side loops; `REPLACE()` is only executed when `--replace` is given.
+- The SQL logic is rendered from a single **Jinja2** template (`templates/query.sql.j2`) so you can easily tweak behavior.
+- Safe-by-default: in **search** mode it only lists matches; in **replace** mode it updates values using `REPLACE(...)`.
 
-## Quick start
+---
+
+## 🚀 Install via Kevin’s Package Manager
+
+If you use **Kevin’s Package Manager**  
+👉 <https://github.com/kevinveenbirkenbach/package-manager>
+
+Install **pgsr** with:
+
+```bash
+pkgmgr install pgsr
+````
+
+After installation, see all commands and options:
+
+```bash
+pgsr --help
+```
+
+---
+
+## 🧪 Quick start
 
 ```bash
 # 1) Install deps (Jinja2 only)
@@ -25,7 +47,9 @@ python main.py -d mydb -p mysecret -s "old.example" -c postgres_db
 python main.py -d mydb -p mysecret -s "old.example" -r "new.example" -c postgres_db
 ```
 
-## Arguments
+---
+
+## 🧰 Arguments
 
 ```
   -h, --help                Show help
@@ -35,14 +59,16 @@ python main.py -d mydb -p mysecret -s "old.example" -r "new.example" -c postgres
   -H, --host TEXT           Host (default: localhost)
   -P, --port INT            Port (default: 5432)
   -s, --search TEXT         (required) Search term
-  -r, --replace TEXT        Replacement term; if provided → **replace mode**
+  -r, --replace TEXT        Replacement term; if provided → replace mode
   -c, --container TEXT      Docker container name to execute `psql` in
   --psql-path TEXT          Path to psql binary (default: psql)
 ```
 
-## What it does
+---
 
-- **Search mode (no `--replace`)**: Lists occurrences of the search text, returning rows with schema, table, column, row identifier and the matched value.
-- **Replace mode (`--replace` given)**: Performs in-place updates with `REPLACE(column, search, replace)` on all matching text/varchar columns, and prints a summary of modified rows per table/column.
+## 📄 License
 
-> Tip: Always take a backup before running replace mode in production.
+Released under the **MIT License**. See [LICENSE](./LICENSE).
+
+**Author:** [Kevin Veen-Birkenbach](https://www.veen.world)
+**Generated with:** ChatGPT — see *[this conversation](https://chatgpt.com/share/689dba44-2e18-800f-bcd2-158002faf8da)*
