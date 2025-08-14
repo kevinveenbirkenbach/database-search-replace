@@ -1,4 +1,3 @@
-\
 #!/usr/bin/env python3
 # main.py
 # Render a SQL script from Jinja2 and execute via psql locally or with `docker exec` when --container is set.
