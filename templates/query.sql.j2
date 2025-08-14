@@ -9,7 +9,7 @@ SET client_min_messages = NOTICE;
 DO $$
 DECLARE
   r RECORD;
-  search_text TEXT := {{ search_text | tojson }};
+  search_text TEXT := '{{ search_text | replace("'", "''") }}';
   pattern     TEXT := '%' || search_text || '%';
   sql         TEXT;
 BEGIN
@@ -59,8 +59,8 @@ ORDER BY table_schema, table_name, column_name, row_identifier;
 DO $$
 DECLARE
   r RECORD;
-  search_text  TEXT := {{ search_text | tojson }};
-  replace_text TEXT := {{ replace_text | tojson }};
+  search_text  TEXT := '{{ search_text | replace("'", "''") }}';
+  replace_text TEXT := '{{ replace_text | replace("'", "''") }}';
   pattern      TEXT := '%' || search_text || '%';
   sql          TEXT;
   updated_rows BIGINT;
