@@ -1,0 +1,111 @@
+-- Rendered by Jinja2 from templates/query.sql.j2
+-- mode: {{ mode }}
+-- search: {{ search_text }}
+-- replace: {{ replace_text if replace_text is not none else '(none)' }}
+
+SET client_min_messages = NOTICE;
+
+{% if mode == 'search' %}
+DO $$
+DECLARE
+  r RECORD;
+  search_text TEXT := {{ search_text | tojson }};
+  pattern     TEXT := '%' || search_text || '%';
+  sql         TEXT;
+BEGIN
+  CREATE TEMP TABLE IF NOT EXISTS search_results (
+    table_schema   TEXT,
+    table_name     TEXT,
+    column_name    TEXT,
+    row_identifier TEXT,
+    value          TEXT
+  ) ON COMMIT DROP;
+
+  TRUNCATE search_results;
+
+  FOR r IN
+    SELECT table_schema, table_name, column_name
+    FROM information_schema.columns
+    WHERE data_type IN ('text','character varying','character')
+      AND table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND table_schema NOT LIKE 'pg_temp%%'
+      AND table_schema NOT LIKE 'pg_toast_temp%%'
+  LOOP
+    sql := format(
+      'INSERT INTO search_results(table_schema, table_name, column_name, row_identifier, value)
+       SELECT %L, %L, %L, ctid::text, %I
+       FROM %I.%I
+       WHERE %I ILIKE %L',
+       r.table_schema, r.table_name, r.column_name,
+       r.column_name,
+       r.table_schema, r.table_name,
+       r.column_name,
+       pattern
+    );
+    BEGIN
+      EXECUTE sql;
+    EXCEPTION
+      WHEN insufficient_privilege OR undefined_table THEN
+        CONTINUE;
+    END;
+  END LOOP;
+END $$;
+
+-- Output results
+SELECT *
+FROM search_results
+ORDER BY table_schema, table_name, column_name, row_identifier;
+{% else %}
+DO $$
+DECLARE
+  r RECORD;
+  search_text  TEXT := {{ search_text | tojson }};
+  replace_text TEXT := {{ replace_text | tojson }};
+  pattern      TEXT := '%' || search_text || '%';
+  sql          TEXT;
+  updated_rows BIGINT;
+BEGIN
+  CREATE TEMP TABLE IF NOT EXISTS replace_summary(
+    table_schema TEXT,
+    table_name   TEXT,
+    column_name  TEXT,
+    rows_updated BIGINT
+  ) ON COMMIT DROP;
+
+  TRUNCATE replace_summary;
+
+  FOR r IN
+    SELECT table_schema, table_name, column_name
+    FROM information_schema.columns
+    WHERE data_type IN ('text','character varying','character')
+      AND table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND table_schema NOT LIKE 'pg_temp%%'
+      AND table_schema NOT LIKE 'pg_toast_temp%%'
+  LOOP
+    sql := format(
+      'UPDATE %I.%I
+       SET %I = REPLACE(%I, %L, %L)
+       WHERE %I ILIKE %L',
+       r.table_schema, r.table_name, r.column_name,
+       r.column_name, search_text, replace_text,
+       r.column_name, pattern
+    );
+    BEGIN
+      EXECUTE sql;
+      GET DIAGNOSTICS updated_rows = ROW_COUNT;
+      INSERT INTO replace_summary VALUES (r.table_schema, r.table_name, r.column_name, updated_rows);
+    EXCEPTION
+      WHEN insufficient_privilege OR undefined_table THEN
+        CONTINUE;
+    END;
+  END LOOP;
+
+  RAISE NOTICE 'Bulk replace finished.';
+END $$;
+
+-- Per-column summary
+SELECT *
+FROM replace_summary
+WHERE rows_updated > 0
+ORDER BY rows_updated DESC, table_schema, table_name, column_name;
+{% endif %}
