@@ -7,7 +7,6 @@ SET client_min_messages = NOTICE;
 
 {% if mode == 'search' %}
 
--- Create temp table OUTSIDE the DO block and preserve rows across statements
 CREATE TEMP TABLE IF NOT EXISTS search_results (
   table_schema   TEXT,
   table_name     TEXT,
@@ -21,30 +20,64 @@ TRUNCATE search_results;
 DO $$
 DECLARE
   r RECORD;
-  -- Proper SQL string literal quoting
   search_text TEXT := '{{ search_text | replace("'", "''") }}';
   pattern     TEXT := '%' || search_text || '%';
   sql         TEXT;
 BEGIN
   FOR r IN
-    SELECT table_schema, table_name, column_name
-    FROM information_schema.columns
-    WHERE data_type IN ('text','character varying','character')
-      AND table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
-      AND table_schema NOT LIKE 'pg_temp%%'
-      AND table_schema NOT LIKE 'pg_toast_temp%%'
+    SELECT
+      c.table_schema,
+      c.table_name,
+      c.column_name,
+      c.data_type,
+      c.udt_name
+    FROM information_schema.columns c
+    WHERE c.table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND c.table_schema NOT LIKE 'pg_temp%%'
+      AND c.table_schema NOT LIKE 'pg_toast_temp%%'
+      AND (
+        c.data_type IN ('text','character varying','character','json','jsonb','ARRAY','citext')
+        OR c.udt_name IN ('_text','_varchar','_bpchar','_citext')
+      )
   LOOP
-    sql := format(
-      'INSERT INTO search_results(table_schema, table_name, column_name, row_identifier, value)
-       SELECT %L, %L, %L, ctid::text, %I
-       FROM %I.%I
-       WHERE %I ILIKE %L',
-       r.table_schema, r.table_name, r.column_name,
-       r.column_name,
-       r.table_schema, r.table_name,
-       r.column_name,
-       pattern
-    );
+    -- Build a search expression that works for each type
+    IF r.data_type IN ('json','jsonb') THEN
+      sql := format(
+        'INSERT INTO search_results(table_schema, table_name, column_name, row_identifier, value)
+           SELECT %L, %L, %L, ctid::text, (%I)::text
+           FROM %I.%I
+           WHERE (%I)::text ILIKE %L',
+         r.table_schema, r.table_name, r.column_name,
+         r.column_name,
+         r.table_schema, r.table_name,
+         r.column_name, pattern
+      );
+    ELSIF r.data_type = 'ARRAY' OR r.udt_name IN ('_text','_varchar','_bpchar','_citext') THEN
+      -- Simple but effective: cast whole array to text for searching
+      sql := format(
+        'INSERT INTO search_results(table_schema, table_name, column_name, row_identifier, value)
+           SELECT %L, %L, %L, ctid::text, (%I)::text
+           FROM %I.%I
+           WHERE (%I)::text ILIKE %L',
+         r.table_schema, r.table_name, r.column_name,
+         r.column_name,
+         r.table_schema, r.table_name,
+         r.column_name, pattern
+      );
+    ELSE
+      -- text / varchar / char / citext
+      sql := format(
+        'INSERT INTO search_results(table_schema, table_name, column_name, row_identifier, value)
+           SELECT %L, %L, %L, ctid::text, %I
+           FROM %I.%I
+           WHERE %I ILIKE %L',
+         r.table_schema, r.table_name, r.column_name,
+         r.column_name,
+         r.table_schema, r.table_name,
+         r.column_name, pattern
+      );
+    END IF;
+
     BEGIN
       EXECUTE sql;
     EXCEPTION
@@ -54,7 +87,6 @@ BEGIN
   END LOOP;
 END $$;
 
--- Output results and clean up
 SELECT *
 FROM search_results
 ORDER BY table_schema, table_name, column_name, row_identifier;
@@ -64,14 +96,13 @@ DROP TABLE IF EXISTS search_results;
 {% else %}
 
 -- ============================================================
--- REPLACE MODE (No superuser required)
--- - Temporarily rebuild NON-DEFERRABLE FKs to DEFERRABLE INITIALLY DEFERRED
--- - SET CONSTRAINTS ALL DEFERRED
--- - Perform updates across all user tables/columns (text/varchar)
--- - Restore FKs to original state afterwards
+-- REPLACE MODE
+--  - Toggle NON-DEFERRABLE FKs to DEFERRABLE
+--  - SET CONSTRAINTS ALL DEFERRED
+--  - Replace across text/varchar/char/citext, json/jsonb, and text-like arrays
+--  - Restore FKs
 -- ============================================================
 
--- 1) Summary of updates
 CREATE TEMP TABLE IF NOT EXISTS replace_summary(
   table_schema TEXT,
   table_name   TEXT,
@@ -81,31 +112,29 @@ CREATE TEMP TABLE IF NOT EXISTS replace_summary(
 
 TRUNCATE replace_summary;
 
--- 2) Capture NON-DEFERRABLE foreign keys in user schemas to toggle
---    Handle NOT VALID by inserting DEFERRABLE before the NOT VALID suffix.
 CREATE TEMP TABLE IF NOT EXISTS fk_toggle(
-  child_schema     TEXT,
-  child_table      TEXT,
-  conname          TEXT,
-  condef_original  TEXT,
+  child_schema      TEXT,
+  child_table       TEXT,
+  conname           TEXT,
+  condef_original   TEXT,
   condef_deferrable TEXT,
-  condef_restore   TEXT
+  condef_restore    TEXT
 ) ON COMMIT PRESERVE ROWS;
 
 TRUNCATE fk_toggle;
 
 INSERT INTO fk_toggle(child_schema, child_table, conname, condef_original, condef_deferrable, condef_restore)
 SELECT
-  nsc.nspname                    AS child_schema,
-  rc.relname                     AS child_table,
-  con.conname                    AS conname,
-  pg_get_constraintdef(con.oid)  AS condef_original,
+  nsc.nspname,
+  rc.relname,
+  con.conname,
+  pg_get_constraintdef(con.oid),
   CASE
     WHEN pg_get_constraintdef(con.oid) ILIKE '% NOT VALID'
       THEN regexp_replace(pg_get_constraintdef(con.oid), ' NOT VALID$', '') || ' DEFERRABLE INITIALLY DEFERRED NOT VALID'
     ELSE pg_get_constraintdef(con.oid) || ' DEFERRABLE INITIALLY DEFERRED'
-  END                             AS condef_deferrable,
-  pg_get_constraintdef(con.oid)   AS condef_restore
+  END,
+  pg_get_constraintdef(con.oid)
 FROM pg_constraint con
 JOIN pg_class rc      ON rc.oid = con.conrelid
 JOIN pg_namespace nsc ON nsc.oid = rc.relnamespace
@@ -115,127 +144,134 @@ WHERE con.contype = 'f'
   AND nsc.nspname NOT LIKE 'pg_temp%%'
   AND nsc.nspname NOT LIKE 'pg_toast_temp%%';
 
--- 3) Transaction 1: make those FKs deferrable and run updates deferred
 BEGIN;
 
--- 3a) Rebuild NON-DEFERRABLE FKs as DEFERRABLE INITIALLY DEFERRED
 DO $$
 DECLARE
   fk RECORD;
   sql TEXT;
 BEGIN
-  FOR fk IN
-    SELECT child_schema, child_table, conname, condef_deferrable
-    FROM fk_toggle
-  LOOP
-    -- Drop constraint (skip if no privilege)
+  FOR fk IN SELECT child_schema, child_table, conname, condef_deferrable FROM fk_toggle LOOP
     BEGIN
       sql := format('ALTER TABLE %I.%I DROP CONSTRAINT %I;', fk.child_schema, fk.child_table, fk.conname);
       EXECUTE sql;
     EXCEPTION
-      WHEN insufficient_privilege OR undefined_table OR undefined_object THEN
-        CONTINUE;
+      WHEN insufficient_privilege OR undefined_table OR undefined_object THEN CONTINUE;
     END;
 
-    -- Add constraint back as DEFERRABLE
     BEGIN
-      sql := format('ALTER TABLE %I.%I ADD CONSTRAINT %I %s;',
-                    fk.child_schema, fk.child_table, fk.conname, fk.condef_deferrable);
+      sql := format('ALTER TABLE %I.%I ADD CONSTRAINT %I %s;', fk.child_schema, fk.child_table, fk.conname, fk.condef_deferrable);
       EXECUTE sql;
     EXCEPTION
-      WHEN insufficient_privilege OR duplicate_object OR undefined_table THEN
-        CONTINUE;
+      WHEN insufficient_privilege OR duplicate_object OR undefined_table THEN CONTINUE;
     END;
   END LOOP;
 END $$;
 
--- 3b) Defer all constraints until COMMIT
 SET CONSTRAINTS ALL DEFERRED;
 
--- 3c) Perform updates across all user tables / text-like columns
 DO $$
 DECLARE
-  t RECORD;
-  c RECORD;
-  search_text  TEXT := '{{ search_text | replace("'", "''") }}';
+  r RECORD;
+  search_text  TEXT := '{{ search_text  | replace("'", "''") }}';
   replace_text TEXT := '{{ replace_text | replace("'", "''") }}';
   pattern      TEXT := '%' || search_text || '%';
   sql          TEXT;
   updated_rows BIGINT;
 BEGIN
-  FOR t IN
-    SELECT DISTINCT table_schema, table_name
-    FROM information_schema.columns
-    WHERE data_type IN ('text','character varying','character')
-      AND table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
-      AND table_schema NOT LIKE 'pg_temp%%'
-      AND table_schema NOT LIKE 'pg_toast_temp%%'
+  FOR r IN
+    SELECT
+      c.table_schema,
+      c.table_name,
+      c.column_name,
+      c.data_type,
+      c.udt_name
+    FROM information_schema.columns c
+    WHERE c.table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND c.table_schema NOT LIKE 'pg_temp%%'
+      AND c.table_schema NOT LIKE 'pg_toast_temp%%'
+      AND (
+        c.data_type IN ('text','character varying','character','json','jsonb','ARRAY','citext')
+        OR c.udt_name IN ('_text','_varchar','_bpchar','_citext')
+      )
+    GROUP BY c.table_schema, c.table_name, c.column_name, c.data_type, c.udt_name
   LOOP
-    FOR c IN
-      SELECT column_name
-      FROM information_schema.columns
-      WHERE table_schema = t.table_schema
-        AND table_name   = t.table_name
-        AND data_type IN ('text','character varying','character')
-    LOOP
+    IF r.data_type IN ('json','jsonb') THEN
+      -- Replace in textual form, cast back to original JSON/JSONB type
       sql := format(
         'UPDATE %I.%I
-         SET %I = REPLACE(%I, %L, %L)
-         WHERE %I ILIKE %L',
-         t.table_schema, t.table_name, c.column_name,
-         c.column_name, search_text, replace_text,
-         c.column_name, pattern
+           SET %I = REPLACE((%I)::text, %L, %L)::%s
+         WHERE (%I)::text ILIKE %L',
+         r.table_schema, r.table_name,
+         r.column_name, r.column_name, search_text, replace_text, r.data_type,
+         r.column_name, pattern
       );
-      BEGIN
-        EXECUTE sql;
-        GET DIAGNOSTICS updated_rows = ROW_COUNT;
-        IF updated_rows > 0 THEN
-          INSERT INTO replace_summary VALUES (t.table_schema, t.table_name, c.column_name, updated_rows);
-        END IF;
-      EXCEPTION
-        WHEN insufficient_privilege OR undefined_table THEN
-          CONTINUE;
-      END;
-    END LOOP;
+
+    ELSIF r.data_type = 'ARRAY' OR r.udt_name IN ('_text','_varchar','_bpchar','_citext') THEN
+      -- Element-wise replace preserving NULLs and order
+      sql := format(
+        'UPDATE %I.%I
+           SET %I = ARRAY(
+             SELECT CASE WHEN e IS NULL THEN NULL ELSE REPLACE(e, %L, %L) END
+             FROM unnest(%I) AS e
+           )
+         WHERE (%I)::text ILIKE %L',
+         r.table_schema, r.table_name,
+         r.column_name, search_text, replace_text, r.column_name,
+         r.column_name, pattern
+      );
+
+    ELSE
+      -- text / varchar / char / citext
+      sql := format(
+        'UPDATE %I.%I
+           SET %I = REPLACE(%I, %L, %L)
+         WHERE %I ILIKE %L',
+         r.table_schema, r.table_name,
+         r.column_name, r.column_name, search_text, replace_text,
+         r.column_name, pattern
+      );
+    END IF;
+
+    BEGIN
+      EXECUTE sql;
+      GET DIAGNOSTICS updated_rows = ROW_COUNT;
+      IF updated_rows > 0 THEN
+        INSERT INTO replace_summary VALUES (r.table_schema, r.table_name, r.column_name, updated_rows);
+      END IF;
+    EXCEPTION
+      WHEN insufficient_privilege OR undefined_table THEN
+        CONTINUE;
+    END;
   END LOOP;
 END $$;
 
 COMMIT;
 
--- 4) Transaction 2: restore FKs to their original definitions
 BEGIN;
 DO $$
 DECLARE
   fk RECORD;
   sql TEXT;
 BEGIN
-  FOR fk IN
-    SELECT child_schema, child_table, conname, condef_restore
-    FROM fk_toggle
-  LOOP
-    -- Drop DEFERRABLE version
+  FOR fk IN SELECT child_schema, child_table, conname, condef_restore FROM fk_toggle LOOP
     BEGIN
       sql := format('ALTER TABLE %I.%I DROP CONSTRAINT %I;', fk.child_schema, fk.child_table, fk.conname);
       EXECUTE sql;
     EXCEPTION
-      WHEN insufficient_privilege OR undefined_table OR undefined_object THEN
-        CONTINUE;
+      WHEN insufficient_privilege OR undefined_table OR undefined_object THEN CONTINUE;
     END;
 
-    -- Recreate with original definition
     BEGIN
-      sql := format('ALTER TABLE %I.%I ADD CONSTRAINT %I %s;',
-                    fk.child_schema, fk.child_table, fk.conname, fk.condef_restore);
+      sql := format('ALTER TABLE %I.%I ADD CONSTRAINT %I %s;', fk.child_schema, fk.child_table, fk.conname, fk.condef_restore);
       EXECUTE sql;
     EXCEPTION
-      WHEN insufficient_privilege OR duplicate_object OR undefined_table THEN
-        CONTINUE;
+      WHEN insufficient_privilege OR duplicate_object OR undefined_table THEN CONTINUE;
     END;
   END LOOP;
 END $$;
 COMMIT;
 
--- 5) Final report and cleanup
 SELECT *
 FROM replace_summary
 WHERE rows_updated > 0
